@@ -8,6 +8,7 @@ from torch import nn
 
 from observation import ProfilerObservation, ProfilerObservationConfig
 from phase_runtime import PhaseAwareCheckpointRuntime, PhaseInference, PhaseInferenceConfig, PhaseRuntimeConfig
+from policy_controller import CheckpointPolicyConfig, CheckpointPolicyController
 from data import generate_cv_batch, generate_dlrm_batch, generate_lm_batch
 from models import DLRM, DLRMConfig, MoETransformerLM, ResNet50, TransformerConfig, TransformerLM
 from utils import estimate_state_bytes
@@ -32,6 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--ckpt-interval", type=int, default=10)
+    parser.add_argument("--ckpt-max-staleness", type=int, default=50)
+    parser.add_argument("--ckpt-min-interval", type=int, default=2)
+    parser.add_argument("--ckpt-high-latency-s", type=float, default=0.5)
+    parser.add_argument("--ckpt-force-sync-on-stale", action="store_true", default=False)
+    parser.add_argument("--ckpt-compression-low", type=int, default=1)
+    parser.add_argument("--ckpt-compression-high", type=int, default=3)
     parser.add_argument("--phase-a-ratio", type=float, default=0.3)
     parser.add_argument("--phase-a-interval-mul", type=int, default=2)
     parser.add_argument("--output-dir", type=str, default="runs")
@@ -124,7 +131,17 @@ def main() -> None:
         total_steps=args.steps,
         log_every=1,
     )
-    runtime = PhaseAwareCheckpointRuntime(runtime_cfg, args.output_dir)
+    policy_cfg = CheckpointPolicyConfig(
+        base_interval=args.ckpt_interval,
+        max_staleness_steps=args.ckpt_max_staleness,
+        min_interval_steps=args.ckpt_min_interval,
+        high_latency_s=args.ckpt_high_latency_s,
+        force_sync_on_staleness=args.ckpt_force_sync_on_stale,
+        compression_level_low=args.ckpt_compression_low,
+        compression_level_high=args.ckpt_compression_high,
+    )
+    policy_controller = CheckpointPolicyController(policy_cfg)
+    runtime = PhaseAwareCheckpointRuntime(runtime_cfg, args.output_dir, policy_controller=policy_controller)
     phase_log_path = os.path.join(args.output_dir, "logs", "phase_inference.csv")
     phase_cfg = PhaseInferenceConfig(log_path=phase_log_path, window_size=args.obs_window)
     phase_inference = PhaseInference(phase_cfg)
@@ -270,6 +287,12 @@ def main() -> None:
                     "incr_applicable": int(phase_state.delta_applicable),
                     "comp_applicable": int(phase_state.compression_applicable),
                     "phase_id": phase_state.phase_id,
+                },
+                phase_state=phase_state,
+                observation_stats={
+                    "staleness_steps": staleness,
+                    "ckpt_latency": ckpt_latency,
+                    "queue_depth": queue_depth,
                 },
             )
     finally:

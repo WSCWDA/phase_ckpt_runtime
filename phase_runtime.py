@@ -3,16 +3,19 @@ from __future__ import annotations
 # Phase-aware Checkpoint Runtime（简化版 4.2）
 
 import csv
+import io
 import json
 import os
 import queue
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
 
+from policy_controller import CheckpointPolicyController, PolicyDecision
 from utils import capture_rng_state
 
 
@@ -378,7 +381,12 @@ class AsyncWriter:
 
 class PhaseAwareCheckpointRuntime:
     """统一的 Phase-aware Checkpoint Runtime 接口。"""
-    def __init__(self, cfg: PhaseRuntimeConfig, output_dir: str):
+    def __init__(
+        self,
+        cfg: PhaseRuntimeConfig,
+        output_dir: str,
+        policy_controller: Optional[CheckpointPolicyController] = None,
+    ):
         self.cfg = cfg
         self.output_dir = output_dir
         self.ckpt_dir = os.path.join(output_dir, "checkpoints")
@@ -397,6 +405,9 @@ class PhaseAwareCheckpointRuntime:
         self.max_ckpt_latency_s = 0.0
         self._lock = threading.Lock()
         self._async_writer = AsyncWriter(cfg.async_queue_size, cfg.async_timeout_s, self._on_async_complete)
+        self._policy_controller = policy_controller
+        self._last_full_state: Optional[Dict[str, torch.Tensor]] = None
+        self._last_full_step: Optional[int] = None
         self._log_file = open(self.log_path, "w", newline="")
         self._writer = csv.DictWriter(
             self._log_file,
@@ -420,6 +431,12 @@ class PhaseAwareCheckpointRuntime:
                 "comp_applicable",
                 "phase_blocked",
                 "phase_id",
+                "policy_do_checkpoint",
+                "policy_use_async",
+                "policy_use_delta",
+                "policy_use_compression",
+                "policy_compression_level",
+                "policy_reason",
             ],
         )
         self._writer.writeheader()
@@ -440,36 +457,93 @@ class PhaseAwareCheckpointRuntime:
     def _phase_a_steps(self) -> int:
         return max(1, int(self.cfg.total_steps * self.cfg.phase_a_ratio))
 
-    def maybe_checkpoint(self, step: int, model, optimizer, metrics_dict: Dict[str, Any]) -> None:
+    def _snapshot_model_state(self, model) -> Dict[str, torch.Tensor]:
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def _build_payload(
+        self,
+        step: int,
+        model,
+        optimizer,
+        decision: Optional[PolicyDecision],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "checkpoint_type": "full",
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "rng_state": capture_rng_state(),
+        }
+        if decision and decision.use_delta and self._last_full_state is not None:
+            delta_state = {
+                name: tensor - self._last_full_state[name]
+                for name, tensor in payload["model"].items()
+                if name in self._last_full_state
+            }
+            payload = {
+                "checkpoint_type": "delta",
+                "base_step": self._last_full_step,
+                "model_delta": delta_state,
+                "optimizer": payload["optimizer"],
+                "step": step,
+                "rng_state": payload["rng_state"],
+            }
+        if decision and decision.use_compression:
+            buffer = io.BytesIO()
+            torch.save(payload, buffer)
+            compressed = zlib.compress(buffer.getvalue(), level=decision.compression_level or 1)
+            payload = {
+                "checkpoint_type": "compressed",
+                "compression_level": decision.compression_level or 1,
+                "compressed_payload": compressed,
+                "step": step,
+            }
+        return payload
+
+    def maybe_checkpoint(
+        self,
+        step: int,
+        model,
+        optimizer,
+        metrics_dict: Dict[str, Any],
+        phase_state: Optional[PhaseState] = None,
+        observation_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """按策略触发 checkpoint，并记录观测指标。"""
         ckpt_triggered = False
         ckpt_mode = "none"
         ckpt_bytes = 0
         ckpt_latency = 0.0
+        policy_decision: Optional[PolicyDecision] = None
 
-        interval = self.cfg.ckpt_interval_steps
-        if self.cfg.strategy == "phase":
-            if step <= self._phase_a_steps():
-                interval = max(1, interval * self.cfg.phase_a_interval_mul)
-                ckpt_mode = "sync"
+        observation_stats = observation_stats or {}
+        if self._policy_controller:
+            policy_decision = self._policy_controller.decide(step, phase_state, observation_stats)
+            if not policy_decision.do_checkpoint:
+                ckpt_mode = "skipped_by_policy"
             else:
-                ckpt_mode = "async"
-        elif self.cfg.strategy == "sync":
-            ckpt_mode = "sync"
-        elif self.cfg.strategy == "async":
-            ckpt_mode = "async"
+                ckpt_mode = "async" if policy_decision.use_async else "sync"
         else:
-            raise ValueError(f"Unsupported strategy: {self.cfg.strategy}")
+            interval = self.cfg.ckpt_interval_steps
+            if self.cfg.strategy == "phase":
+                if step <= self._phase_a_steps():
+                    interval = max(1, interval * self.cfg.phase_a_interval_mul)
+                    ckpt_mode = "sync"
+                else:
+                    ckpt_mode = "async"
+            elif self.cfg.strategy == "sync":
+                ckpt_mode = "sync"
+            elif self.cfg.strategy == "async":
+                ckpt_mode = "async"
+            else:
+                raise ValueError(f"Unsupported strategy: {self.cfg.strategy}")
 
-        if step % interval == 0:
+        if (policy_decision and policy_decision.do_checkpoint) or (
+            not policy_decision and step % self.cfg.ckpt_interval_steps == 0
+        ):
             ckpt_triggered = True
             with torch.profiler.record_function("checkpoint_serialize"):
-                payload = {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "rng_state": capture_rng_state(),
-                }
+                payload = self._build_payload(step, model, optimizer, policy_decision)
             path = self._checkpoint_path(step)
             if ckpt_mode == "sync":
                 start = time.time()
@@ -485,7 +559,7 @@ class PhaseAwareCheckpointRuntime:
                     self.num_completed += 1
                     self.num_issued += 1
                     self.max_ckpt_latency_s = max(self.max_ckpt_latency_s, ckpt_latency)
-            else:
+            elif ckpt_mode == "async":
                 task = AsyncTask(step=step, payload=payload, path=path)
                 self.num_issued += 1
                 submitted = self._async_writer.submit(task)
@@ -503,6 +577,9 @@ class PhaseAwareCheckpointRuntime:
                         self.last_completed_latency_s = ckpt_latency
                         self.num_completed += 1
                         self.max_ckpt_latency_s = max(self.max_ckpt_latency_s, ckpt_latency)
+            if ckpt_triggered:
+                self._last_full_state = self._snapshot_model_state(model)
+                self._last_full_step = step
 
         with self._lock:
             last_persisted = self._last_persisted_step
@@ -530,6 +607,12 @@ class PhaseAwareCheckpointRuntime:
             "comp_applicable": metrics_dict.get("comp_applicable"),
             "phase_blocked": metrics_dict.get("phase_blocked"),
             "phase_id": metrics_dict.get("phase_id"),
+            "policy_do_checkpoint": int(policy_decision.do_checkpoint) if policy_decision else None,
+            "policy_use_async": int(policy_decision.use_async) if policy_decision else None,
+            "policy_use_delta": int(policy_decision.use_delta) if policy_decision else None,
+            "policy_use_compression": int(policy_decision.use_compression) if policy_decision else None,
+            "policy_compression_level": policy_decision.compression_level if policy_decision else None,
+            "policy_reason": policy_decision.reason if policy_decision else None,
         }
         self._writer.writerow(log_row)
         self._log_file.flush()
