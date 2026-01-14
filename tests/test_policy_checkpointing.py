@@ -1,13 +1,17 @@
 import tempfile
 import unittest
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    torch = None
 
 from phase_runtime import PhaseAwareCheckpointRuntime, PhaseRuntimeConfig, PhaseState
 from policy_controller import CheckpointPolicyConfig, CheckpointPolicyController
 
 
 class PolicyCheckpointingTests(unittest.TestCase):
+    @unittest.skipIf(torch is None, "torch is required for checkpoint tests")
     def _make_runtime(self, output_dir: str) -> PhaseAwareCheckpointRuntime:
         runtime_cfg = PhaseRuntimeConfig(
             strategy="sync",
@@ -29,6 +33,8 @@ class PolicyCheckpointingTests(unittest.TestCase):
         return PhaseAwareCheckpointRuntime(runtime_cfg, output_dir, policy_controller=controller)
 
     def test_delta_checkpoint_payload(self) -> None:
+        if torch is None:
+            self.skipTest("torch is required for checkpoint tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = self._make_runtime(tmpdir)
             model = torch.nn.Linear(2, 2)
@@ -65,6 +71,8 @@ class PolicyCheckpointingTests(unittest.TestCase):
             runtime.close()
 
     def test_compression_checkpoint_payload(self) -> None:
+        if torch is None:
+            self.skipTest("torch is required for checkpoint tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = self._make_runtime(tmpdir)
             model = torch.nn.Linear(2, 2)
