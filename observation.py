@@ -253,7 +253,12 @@ class ProfilerObservation:
 
         def _cuda_us(key: str) -> Optional[float]:
             evt = events.get(key)
-            return evt.cuda_time_total if evt is not None else None
+            if evt is None:
+                return None
+            cuda_total = getattr(evt, "cuda_time_total", None)
+            if cuda_total is None:
+                cuda_total = getattr(evt, "self_cuda_time_total", None)
+            return cuda_total
 
         step_cpu = _cpu_us("train_step")
         step_cuda = _cuda_us("train_step")
