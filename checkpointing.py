@@ -2,7 +2,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -21,10 +21,17 @@ class PendingCheckpoint:
 
 class CheckpointManager:
     """旧版 checkpoint 管理器（保留备用）。"""
-    def __init__(self, base_dir: str, mode: str, io_delay: float = 0.0):
+    def __init__(
+        self,
+        base_dir: str,
+        mode: str,
+        io_delay: float = 0.0,
+        phase_inference: Optional[Any] = None,
+    ):
         self.base_dir = base_dir
         self.mode = mode
         self.io_delay = io_delay
+        self.phase_inference = phase_inference
         self.pending: List[PendingCheckpoint] = []
         self._initialized_pg = False
         self.num_issued = 0
@@ -57,7 +64,11 @@ class CheckpointManager:
             "ckpt_bytes": bytes_estimate,
             "ckpt_latency": 0.0,
         }
-        if self.mode == "sync":
+        mode = self.mode
+        if self.mode == "phase" and self.phase_inference is not None:
+            mode = "async" if self.phase_inference.should_enable_async_ckpt() else "sync"
+
+        if mode == "sync":
             start = time.time()
             writer = FileSystemWriter(path)
             save(state, storage_writer=writer)
@@ -71,8 +82,8 @@ class CheckpointManager:
             self.max_ckpt_latency_s = max(self.max_ckpt_latency_s, metadata["ckpt_latency"])
             return metadata
 
-        if self.mode != "async":
-            raise ValueError(f"Unsupported checkpoint mode: {self.mode}")
+        if mode != "async":
+            raise ValueError(f"Unsupported checkpoint mode: {mode}")
 
         self._ensure_distributed()
         start = time.time()

@@ -3,12 +3,13 @@ from __future__ import annotations
 # Phase-aware Checkpoint Runtime（简化版 4.2）
 
 import csv
+import json
 import os
 import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -34,107 +35,288 @@ class PhaseRuntimeConfig:
 class PhaseState:
     """Phase 推断输出状态。"""
     async_applicable: bool
-    incr_applicable: bool
-    comp_applicable: bool
+    delta_applicable: bool
+    compression_applicable: bool
     reason: Dict[str, Any]
     phase_id: str
 
 
+@dataclass
+class PhaseInferenceConfig:
+    """Phase inference 的阈值与稳定性配置。"""
+
+    window_size: int = 50
+    min_phase_steps: int = 10
+    vote_threshold_async: int = 3
+    vote_threshold_delta: int = 3
+    vote_threshold_compression: int = 2
+    async_enter_ratio: float = 1.0
+    async_exit_ratio: float = 0.9
+    async_queue_trend_tolerance: float = 0.0
+    compute_cv_enter: float = 0.2
+    compute_cv_exit: float = 0.3
+    delta_ratio_enter: float = 0.2
+    delta_ratio_exit: float = 0.3
+    delta_spike_ratio_enter: float = 3.0
+    delta_spike_ratio_exit: float = 4.0
+    compression_error_enter: float = 0.02
+    compression_error_exit: float = 0.03
+    loss_trend_tolerance: float = 0.0
+    param_dist_cv_enter: float = 0.2
+    param_dist_cv_exit: float = 0.3
+    log_path: Optional[str] = None
+
+
 class PhaseInference:
-    """基于窗口统计与阈值的 Phase Inference（带抗抖动）。"""
-    def __init__(
-        self,
-        window_size: int,
-        min_duration: int,
-        async_q_max: int,
-        async_staleness_max: int,
-        async_overlap_margin: float,
-        incr_delta_thres: float,
-        comp_stability_thres: float,
-        incr_default: bool,
-        switch_k: int = 1,
-    ):
-        self.window_size = window_size
-        self.min_duration = min_duration
-        self.async_q_max = async_q_max
-        self.async_staleness_max = async_staleness_max
-        self.async_overlap_margin = async_overlap_margin
-        self.incr_delta_thres = incr_delta_thres
-        self.comp_stability_thres = comp_stability_thres
-        self.incr_default = incr_default
-        self.switch_k = switch_k
-        self.current_phase = PhaseState(False, incr_default, False, {}, "A0_I0_C0")
-        self.phase_duration_steps = 0
-        self._candidate_count = 0
+    """基于窗口统计的适用性 Phase 推断（系统运行时视角）。"""
 
-    def infer(self, current_step: int, stats: Dict[str, Optional[float]]) -> PhaseState:
-        """根据统计量输出稳定的 phase 状态。"""
-        c_bar = stats.get("C_bar")
-        w_bar = stats.get("W_bar")
-        q_bar = stats.get("Q_bar")
-        s_bar = stats.get("S_bar")
-        d_bar = stats.get("D_bar")
+    def __init__(self, cfg: PhaseInferenceConfig):
+        self.cfg = cfg
+        self._history: List[Dict[str, Optional[float]]] = []
+        self._current = PhaseState(False, False, False, {}, "A0_D0_C0")
+        self._phase_steps = 0
+        self._log_file = None
+        self._log_writer = None
+        if cfg.log_path:
+            os.makedirs(os.path.dirname(cfg.log_path), exist_ok=True)
+            self._log_file = open(cfg.log_path, "w", newline="")
+            self._log_writer = csv.DictWriter(
+                self._log_file,
+                fieldnames=[
+                    "step",
+                    "async_applicable",
+                    "delta_applicable",
+                    "compression_applicable",
+                    "phase_id",
+                    "transition",
+                    "compute_time_avg",
+                    "checkpoint_write_p95",
+                    "queue_depth_trend",
+                    "compute_time_cv",
+                    "delta_ratio_avg",
+                    "delta_trend",
+                    "param_change_spike_ratio",
+                    "compression_error_p95",
+                    "loss_trend",
+                    "param_dist_cv",
+                    "async_votes",
+                    "delta_votes",
+                    "compression_votes",
+                    "async_conditions",
+                    "delta_conditions",
+                    "compression_conditions",
+                ],
+            )
+            self._log_writer.writeheader()
 
-        async_ok = False
-        if q_bar is not None and s_bar is not None:
-            if w_bar is not None and c_bar is not None:
-                async_ok = c_bar >= w_bar + self.async_overlap_margin and q_bar <= self.async_q_max
-            else:
-                async_ok = q_bar <= self.async_q_max
-            async_ok = async_ok and s_bar <= self.async_staleness_max
+    def _window(self) -> List[Dict[str, Optional[float]]]:
+        return self._history[-self.cfg.window_size :]
 
-        if d_bar is None:
-            incr_ok = self.incr_default
-        else:
-            incr_ok = d_bar <= self.incr_delta_thres
+    def _extract_series(self, key: str) -> List[float]:
+        return [item[key] for item in self._window() if item.get(key) is not None]
 
-        if d_bar is None:
-            comp_ok = False
-        else:
-            comp_ok = d_bar <= self.comp_stability_thres
+    def _moving_avg(self, values: List[float]) -> Optional[float]:
+        return sum(values) / len(values) if values else None
 
-        next_phase_id = f"A{int(async_ok)}_I{int(incr_ok)}_C{int(comp_ok)}"
-        reason = {
-            "C_bar": c_bar,
-            "W_bar": w_bar,
-            "Q_bar": q_bar,
-            "S_bar": s_bar,
-            "D_bar": d_bar,
-            "candidate_phase": next_phase_id,
-            "current_phase": self.current_phase.phase_id,
+    def _percentile(self, values: List[float], pct: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+        return ordered[min(max(idx, 0), len(ordered) - 1)]
+
+    def _coefficient_of_variation(self, values: List[float]) -> Optional[float]:
+        if len(values) < 2:
+            return None
+        mean = sum(values) / len(values)
+        if mean == 0:
+            return None
+        variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+        return (variance**0.5) / abs(mean)
+
+    def _trend(self, values: List[float], tolerance: float) -> str:
+        if len(values) < 2:
+            return "stable"
+        diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+        increasing = all(diff >= -tolerance for diff in diffs) and any(diff > tolerance for diff in diffs)
+        decreasing = all(diff <= tolerance for diff in diffs) and any(diff < -tolerance for diff in diffs)
+        if increasing:
+            return "increasing"
+        if decreasing:
+            return "decreasing"
+        return "stable"
+
+    def _ratio(self, numer: List[float], denom: List[float]) -> List[float]:
+        ratios = []
+        for n, d in zip(numer, denom):
+            if d:
+                ratios.append(n / d)
+        return ratios
+
+    def _apply_hysteresis(self, current: bool, enter: bool, exit: bool) -> bool:
+        if current:
+            return not exit
+        return enter
+
+    def _vote(self, signals: Dict[str, bool], threshold: int) -> bool:
+        return sum(1 for val in signals.values() if val) >= threshold
+
+    def update(self, observation_snapshot: Dict[str, Optional[float]]) -> None:
+        """更新观测窗口并做 phase 推断。"""
+        self._history.append(dict(observation_snapshot))
+        if len(self._history) > self.cfg.window_size * 2:
+            self._history = self._history[-self.cfg.window_size :]
+        window = self._window()
+        if len(window) < 2:
+            return
+
+        compute_times = self._extract_series("compute_time")
+        ckpt_write_times = self._extract_series("checkpoint_write_time")
+        queue_depth = self._extract_series("checkpoint_queue_depth")
+        delta_sizes = self._extract_series("delta_size")
+        full_sizes = self._extract_series("full_ckpt_size")
+        param_change = self._extract_series("parameter_change_norm")
+        compression_error = self._extract_series("compression_error")
+        loss_series = self._extract_series("loss")
+        param_dist_metric = self._extract_series("param_dist_metric")
+
+        compute_avg = self._moving_avg(compute_times)
+        ckpt_p95 = self._percentile(ckpt_write_times, 95)
+        queue_trend = self._trend(queue_depth, self.cfg.async_queue_trend_tolerance) if queue_depth else "stable"
+        compute_cv = self._coefficient_of_variation(compute_times)
+        delta_ratio = self._ratio(delta_sizes, full_sizes)
+        delta_avg = self._moving_avg(delta_ratio)
+        delta_trend = self._trend(delta_sizes, 0.0) if delta_sizes else "stable"
+        param_change_p50 = self._percentile(param_change, 50)
+        param_change_p95 = self._percentile(param_change, 95)
+        param_change_spike_ratio = (
+            (param_change_p95 / param_change_p50) if param_change_p50 and param_change_p95 else None
+        )
+        compression_p95 = self._percentile(compression_error, 95)
+        loss_trend = self._trend(loss_series, self.cfg.loss_trend_tolerance) if loss_series else "stable"
+        param_dist_cv = self._coefficient_of_variation(param_dist_metric)
+
+        async_conditions = {
+            "compute_vs_ckpt": (
+                compute_avg is not None
+                and ckpt_p95 is not None
+                and compute_avg >= ckpt_p95 * self.cfg.async_enter_ratio
+            ),
+            "queue_not_increasing": queue_trend != "increasing",
+            "compute_stable": (compute_cv is not None and compute_cv <= self.cfg.compute_cv_enter),
         }
+        async_exit = (
+            compute_avg is not None
+            and ckpt_p95 is not None
+            and compute_avg < ckpt_p95 * self.cfg.async_exit_ratio
+        ) or (compute_cv is not None and compute_cv >= self.cfg.compute_cv_exit)
 
-        if next_phase_id == self.current_phase.phase_id:
-            self.phase_duration_steps += 1
-            self._candidate_count = 0
-            return self.current_phase
+        delta_conditions = {
+            "delta_ratio": delta_avg is not None and delta_avg <= self.cfg.delta_ratio_enter,
+            "param_locality": (
+                param_change_spike_ratio is not None and param_change_spike_ratio <= self.cfg.delta_spike_ratio_enter
+            ),
+            "delta_trend": delta_trend in ("stable", "decreasing"),
+        }
+        delta_exit = (
+            delta_avg is not None and delta_avg >= self.cfg.delta_ratio_exit
+        ) or (
+            param_change_spike_ratio is not None
+            and param_change_spike_ratio >= self.cfg.delta_spike_ratio_exit
+        )
 
-        if self.phase_duration_steps < self.min_duration:
-            self.phase_duration_steps += 1
-            reason["blocked_by_min_duration"] = True
-            return PhaseState(
-                self.current_phase.async_applicable,
-                self.current_phase.incr_applicable,
-                self.current_phase.comp_applicable,
-                reason,
-                self.current_phase.phase_id,
+        compression_conditions = {
+            "param_dist_stable": (
+                param_dist_cv is not None and param_dist_cv <= self.cfg.param_dist_cv_enter
+            ),
+            "compression_error": compression_p95 is not None and compression_p95 <= self.cfg.compression_error_enter,
+            "loss_not_degrading": loss_trend != "increasing",
+        }
+        compression_exit = (
+            compression_p95 is not None and compression_p95 >= self.cfg.compression_error_exit
+        ) or (
+            param_dist_cv is not None and param_dist_cv >= self.cfg.param_dist_cv_exit
+        ) or (
+            loss_trend == "increasing"
+        )
+
+        async_vote = self._vote(async_conditions, self.cfg.vote_threshold_async)
+        delta_vote = self._vote(delta_conditions, self.cfg.vote_threshold_delta)
+        compression_vote = self._vote(compression_conditions, self.cfg.vote_threshold_compression)
+
+        async_applicable = self._apply_hysteresis(self._current.async_applicable, async_vote, async_exit)
+        delta_applicable = self._apply_hysteresis(self._current.delta_applicable, delta_vote, delta_exit)
+        compression_applicable = self._apply_hysteresis(
+            self._current.compression_applicable, compression_vote, compression_exit
+        )
+
+        candidate_id = f"A{int(async_applicable)}_D{int(delta_applicable)}_C{int(compression_applicable)}"
+        transition = ""
+        if candidate_id != self._current.phase_id and self._phase_steps >= self.cfg.min_phase_steps:
+            transition = f"{self._current.phase_id}->{candidate_id}"
+            self._current = PhaseState(
+                async_applicable,
+                delta_applicable,
+                compression_applicable,
+                {
+                    "async_conditions": async_conditions,
+                    "delta_conditions": delta_conditions,
+                    "compression_conditions": compression_conditions,
+                },
+                candidate_id,
             )
+            self._phase_steps = 0
+        else:
+            self._phase_steps += 1
 
-        self._candidate_count += 1
-        if self._candidate_count < self.switch_k:
-            reason["blocked_by_switch_k"] = True
-            return PhaseState(
-                self.current_phase.async_applicable,
-                self.current_phase.incr_applicable,
-                self.current_phase.comp_applicable,
-                reason,
-                self.current_phase.phase_id,
+        if self._log_writer:
+            step = observation_snapshot.get("step")
+            self._log_writer.writerow(
+                {
+                    "step": step,
+                    "async_applicable": int(self._current.async_applicable),
+                    "delta_applicable": int(self._current.delta_applicable),
+                    "compression_applicable": int(self._current.compression_applicable),
+                    "phase_id": self._current.phase_id,
+                    "transition": transition,
+                    "compute_time_avg": compute_avg,
+                    "checkpoint_write_p95": ckpt_p95,
+                    "queue_depth_trend": queue_trend,
+                    "compute_time_cv": compute_cv,
+                    "delta_ratio_avg": delta_avg,
+                    "delta_trend": delta_trend,
+                    "param_change_spike_ratio": param_change_spike_ratio,
+                    "compression_error_p95": compression_p95,
+                    "loss_trend": loss_trend,
+                    "param_dist_cv": param_dist_cv,
+                    "async_votes": int(async_vote),
+                    "delta_votes": int(delta_vote),
+                    "compression_votes": int(compression_vote),
+                    "async_conditions": json.dumps(async_conditions),
+                    "delta_conditions": json.dumps(delta_conditions),
+                    "compression_conditions": json.dumps(compression_conditions),
+                }
             )
+            self._log_file.flush()
 
-        self.current_phase = PhaseState(async_ok, incr_ok, comp_ok, reason, next_phase_id)
-        self.phase_duration_steps = 0
-        self._candidate_count = 0
-        return self.current_phase
+    def current_phase_state(self) -> PhaseState:
+        """返回当前 phase 适用性状态。"""
+        return self._current
+
+    def should_enable_async_ckpt(self) -> bool:
+        return self._current.async_applicable
+
+    def should_enable_delta_ckpt(self) -> bool:
+        return self._current.delta_applicable
+
+    def should_enable_compression_ckpt(self) -> bool:
+        return self._current.compression_applicable
+
+    def close(self) -> None:
+        if self._log_file:
+            self._log_file.close()
 
 
 
@@ -172,7 +354,8 @@ class AsyncWriter:
                 self.queue.task_done()
                 break
             start = time.time()
-            torch.save(task.payload, task.path)
+            with torch.profiler.record_function("checkpoint_write"):
+                torch.save(task.payload, task.path)
             end = time.time()
             ckpt_bytes = os.path.getsize(task.path)
             self.on_complete(task.step, end - start, ckpt_bytes)
@@ -280,16 +463,18 @@ class PhaseAwareCheckpointRuntime:
 
         if step % interval == 0:
             ckpt_triggered = True
-            payload = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "rng_state": capture_rng_state(),
-            }
+            with torch.profiler.record_function("checkpoint_serialize"):
+                payload = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                    "rng_state": capture_rng_state(),
+                }
             path = self._checkpoint_path(step)
             if ckpt_mode == "sync":
                 start = time.time()
-                torch.save(payload, path)
+                with torch.profiler.record_function("checkpoint_write"):
+                    torch.save(payload, path)
                 ckpt_latency = time.time() - start
                 ckpt_bytes = os.path.getsize(path)
                 with self._lock:
@@ -307,7 +492,8 @@ class PhaseAwareCheckpointRuntime:
                 if not submitted:
                     ckpt_mode = "async_fallback_sync"
                     start = time.time()
-                    torch.save(payload, path)
+                    with torch.profiler.record_function("checkpoint_write"):
+                        torch.save(payload, path)
                     ckpt_latency = time.time() - start
                     ckpt_bytes = os.path.getsize(path)
                     with self._lock:
