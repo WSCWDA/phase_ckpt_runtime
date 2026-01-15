@@ -213,25 +213,27 @@ def main() -> None:
     try:
         for step in range(1, args.steps + 1):
             step_start = time.perf_counter()
+            observation.step_begin()
             model.train()
 
-            if args.model == "dlrm":
-                dense, sparse, targets = batcher()
-                logits = model(dense, sparse)
-                loss = loss_fn(logits, targets)
-            elif args.model == "resnet50":
-                images, targets = batcher()
-                logits = model(images)
-                loss = loss_fn(logits, targets)
-            else:
-                input_ids, targets = batcher()
-                if args.model == "deepseek_moe":
-                    logits, aux_loss = model(input_ids)
-                    loss = loss_fn(logits.view(-1, args.vocab_size), targets.view(-1))
-                    loss = loss + args.moe_aux_weight * aux_loss
+            with torch.profiler.record_function("train_step"):
+                if args.model == "dlrm":
+                    dense, sparse, targets = batcher()
+                    logits = model(dense, sparse)
+                    loss = loss_fn(logits, targets)
+                elif args.model == "resnet50":
+                    images, targets = batcher()
+                    logits = model(images)
+                    loss = loss_fn(logits, targets)
                 else:
-                    logits = model(input_ids)
-                    loss = loss_fn(logits.view(-1, args.vocab_size), targets.view(-1))
+                    input_ids, targets = batcher()
+                    if args.model == "deepseek_moe":
+                        logits, aux_loss = model(input_ids)
+                        loss = loss_fn(logits.view(-1, args.vocab_size), targets.view(-1))
+                        loss = loss + args.moe_aux_weight * aux_loss
+                    else:
+                        logits = model(input_ids)
+                        loss = loss_fn(logits.view(-1, args.vocab_size), targets.view(-1))
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
