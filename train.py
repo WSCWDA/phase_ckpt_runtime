@@ -196,6 +196,7 @@ def main() -> None:
     try:
         for step in range(1, args.steps + 1):
             step_start = time.perf_counter()
+            observation.step_begin()
             model.train()
 
             with torch.profiler.record_function("train_step"):
