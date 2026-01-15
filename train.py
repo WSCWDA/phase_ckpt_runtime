@@ -120,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--moe-aux-weight", type=float)
     return parser.parse_args()
 
+from __future__ import print_function
 
 def load_config(args: argparse.Namespace) -> TrainConfig:
     cfg = TrainConfig()
