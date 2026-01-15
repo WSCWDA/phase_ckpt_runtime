@@ -170,6 +170,7 @@ def main() -> None:
         fieldnames=[
             "train_step",
             "elapsed_s",
+            "event_time_s",
             "step_time",
             "compute_time",
             "cpu_overhead_time",
@@ -178,6 +179,9 @@ def main() -> None:
             "checkpoint_write_time",
             "checkpoint_total_time",
             "checkpoint_overlap_ratio",
+            "queue_depth",
+            "last_persisted_step",
+            "staleness_steps",
             "step_time_mean",
             "step_time_var",
             "step_time_p50",
@@ -193,6 +197,11 @@ def main() -> None:
             "step_time_trend",
             "compute_ratio_trend",
             "progress_rate_steps_per_s",
+            "queue_depth_mean",
+            "queue_depth_max",
+            "staleness_mean",
+            "staleness_max",
+            "ckpt_completion_rate_per_s",
         ],
     )
     obs_writer.writeheader()
