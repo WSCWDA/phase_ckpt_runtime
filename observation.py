@@ -205,6 +205,14 @@ class ObservationWorker:
         except queue.Full:
             return
 
+    def step_begin(self) -> None:
+        """兼容接口：训练路径调用时不执行任何阻塞操作。"""
+        return
+
+    def step_end(self) -> None:
+        """兼容接口：训练路径调用时不执行任何阻塞操作。"""
+        return
+
     def _init_profiler(self) -> None:
         if not self.cfg.enabled:
             return
