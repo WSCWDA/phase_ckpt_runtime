@@ -14,7 +14,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, List, Optional
+from typing import Any, Deque, Dict, Iterable, List, Optional
 
 import torch
 from torch import profiler
@@ -192,16 +192,35 @@ class ObservationWorker:
         self.cfg = cfg
         self._records: Deque[Dict[str, Optional[float]]] = deque(maxlen=cfg.window_size)
         self._latest_trace: Dict[str, Optional[float]] = {}
-        self._queue: queue.Queue[Optional[ObservationEvent]] = queue.Queue(maxsize=cfg.window_size * 4)
+        self._queue: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue(maxsize=cfg.window_size * 4)
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._profiler: Optional[profiler.profile] = None
+        if self.cfg.enabled:
+            activities = [profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(profiler.ProfilerActivity.CUDA)
+            schedule = profiler.schedule(
+                wait=self.cfg.schedule_wait,
+                warmup=self.cfg.schedule_warmup,
+                active=self.cfg.schedule_active,
+                repeat=self.cfg.schedule_repeat,
+            )
+            self._profiler = profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                on_trace_ready=self._on_profiler_trace,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self._profiler.__enter__()
         self._thread.start()
 
     def emit(self, event: ObservationEvent) -> None:
         """训练路径的非阻塞事件投递，队列满时直接丢弃。"""
         try:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait({"kind": "event", "payload": event})
         except queue.Full:
             return
 
@@ -210,46 +229,27 @@ class ObservationWorker:
         return
 
     def step_end(self) -> None:
-        """兼容接口：训练路径调用时不执行任何阻塞操作。"""
-        return
-
-    def _init_profiler(self) -> None:
-        if not self.cfg.enabled:
-            return
-        activities = [profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(profiler.ProfilerActivity.CUDA)
-        schedule = profiler.schedule(
-            wait=self.cfg.schedule_wait,
-            warmup=self.cfg.schedule_warmup,
-            active=self.cfg.schedule_active,
-            repeat=self.cfg.schedule_repeat,
-        )
-        self._profiler = profiler.profile(
-            activities=activities,
-            schedule=schedule,
-            on_trace_ready=self._on_profiler_trace,
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-        )
-        self._profiler.__enter__()
+        """推进 profiler 状态机（O(1)，不做统计聚合）。"""
+        if self._profiler is not None:
+            self._profiler.step()
 
     def _worker(self) -> None:
         """后台线程：消费事件、推进 profiler 并更新统计。"""
-        self._init_profiler()
         while True:
-            event = self._queue.get()
-            if event is None:
+            item = self._queue.get()
+            if item is None:
                 self._queue.task_done()
                 break
-            if self._profiler is not None:
-                self._profiler.step()
-            with self._lock:
-                self._latest_trace["step_time"] = event.step_time_s
+            if item["kind"] == "event":
+                event = item["payload"]
+                with self._lock:
+                    self._latest_trace["step_time"] = event.step_time_s
+            elif item["kind"] == "trace":
+                snapshot = item["payload"]
+                with self._lock:
+                    self._latest_trace = snapshot
+                    self._records.append(snapshot)
             self._queue.task_done()
-        if self._profiler is not None:
-            self._profiler.__exit__(None, None, None)
 
     def _percentile(self, values: List[float], pct: float) -> Optional[float]:
         if not values:
@@ -318,9 +318,10 @@ class ObservationWorker:
             "checkpoint_write_time": checkpoint_write_time,
             "checkpoint_overlap_ratio": overlap_ratio,
         }
-        with self._lock:
-            self._latest_trace = snapshot
-            self._records.append(snapshot)
+        try:
+            self._queue.put_nowait({"kind": "trace", "payload": snapshot})
+        except queue.Full:
+            return
 
     def get_window_stats(self) -> Dict[str, Optional[float]]:
         """返回窗口统计（可能滞后）。"""
@@ -361,6 +362,8 @@ class ObservationWorker:
     def close(self) -> None:
         self._queue.put(None)
         self._thread.join()
+        if self._profiler is not None:
+            self._profiler.__exit__(None, None, None)
 
 
 class ProfilerObservation:

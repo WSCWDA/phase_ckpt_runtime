@@ -223,6 +223,7 @@ def main() -> None:
             with torch.profiler.record_function("optimizer_step"):
                 optimizer.step()
             observation.emit(ObservationEvent(step_id=step, step_time_s=time.perf_counter() - step_start))
+            observation.step_end()
 
             step_time = time.perf_counter() - step_start
             queue_depth = runtime.get_queue_depth()
