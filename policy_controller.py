@@ -50,7 +50,10 @@ class CheckpointPolicyController:
         phase_state: Optional[PhaseState],
         observation_stats: Dict[str, Any],
     ) -> PolicyDecision:
-        """决策是否触发 checkpoint，以及启用哪些机制。"""
+        """决策是否触发 checkpoint，以及启用哪些机制。
+
+        Observation stats 可能是滞后数据，策略需要对缺失或过时信号具备容错性。
+        """
 
         async_applicable = phase_state.async_applicable if phase_state else False
         delta_applicable = phase_state.delta_applicable if phase_state else False

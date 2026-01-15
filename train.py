@@ -6,7 +6,7 @@ import time
 import torch
 from torch import nn
 
-from observation import ProfilerObservation, ProfilerObservationConfig
+from observation import ObservationEvent, ObservationWorker, ProfilerObservationConfig
 from phase_runtime import PhaseAwareCheckpointRuntime, PhaseInference, PhaseInferenceConfig, PhaseRuntimeConfig
 from policy_controller import CheckpointPolicyConfig, CheckpointPolicyController
 from data import generate_cv_batch, generate_dlrm_batch, generate_lm_batch
@@ -153,7 +153,7 @@ def main() -> None:
         schedule_active=args.profiler_active,
         schedule_repeat=args.profiler_repeat,
     )
-    observation = ProfilerObservation(profiler_cfg)
+    observation = ObservationWorker(profiler_cfg)
     obs_log_path = os.path.join(args.output_dir, "logs", "obs_metrics.csv")
     os.makedirs(os.path.dirname(obs_log_path), exist_ok=True)
     obs_log_file = open(obs_log_path, "w", newline="")
@@ -222,7 +222,7 @@ def main() -> None:
             loss.backward()
             with torch.profiler.record_function("optimizer_step"):
                 optimizer.step()
-            observation.step_end()
+            observation.emit(ObservationEvent(step_id=step, step_time_s=time.perf_counter() - step_start))
 
             step_time = time.perf_counter() - step_start
             queue_depth = runtime.get_queue_depth()
@@ -248,14 +248,15 @@ def main() -> None:
                     parameter_change_norm = float(torch.sqrt(sq_sum).item())
                 prev_params = [param.detach().clone() for param in params_list]
 
-            obs_snapshot = observation.snapshot()
+            obs_stats = observation.get_window_stats()
+            obs_snapshot = {**observation.get_latest_trace(), **obs_stats}
             obs_snapshot.update({"step_time": obs_snapshot.get("step_time") or step_time})
 
             phase_inference.update(
                 {
                     "step": step,
-                    "compute_time": obs_snapshot.get("compute_time"),
-                    "checkpoint_write_time": obs_snapshot.get("checkpoint_write_time") or ckpt_latency,
+                    "compute_time": obs_stats.get("compute_time_mean"),
+                    "checkpoint_write_time": obs_stats.get("checkpoint_write_p95") or ckpt_latency,
                     "checkpoint_queue_depth": queue_depth,
                     "delta_size": parameter_change_norm,
                     "full_ckpt_size": full_ckpt_size,
