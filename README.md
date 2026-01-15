@@ -48,14 +48,14 @@
 - `maybe_checkpoint()` 调用策略控制器获取决策，决定是否写盘、走 sync 还是 async，并执行写盘或提交异步队列。【F:phase_runtime.py†L456-L579】  
 - 在每步日志中追加 `policy_*` 字段，记录触发原因与机制选择，便于后续分析。【F:phase_runtime.py†L545-L573】  
 
-### 5) 训练主循环：`train_main.py`
+### 5) 训练主循环：`train.py`
 **职能**  
 - 初始化 Observation、PhaseInference、PolicyController 与 Checkpoint Runtime，并在训练循环中按步调用。  
 
 **实现要点**  
-- 每步调用 `observation.step_begin()/step_end()` 与 `ProfilerObservation.snapshot()` 获取观测快照并写入 `obs_metrics.csv`。【F:train_main.py†L198-L290】  
-- 观测快照喂给 `PhaseInference.update()` 产生适用性状态。【F:train_main.py†L271-L285】  
-- 将 `phase_state` 与 `observation_stats` 传入 `maybe_checkpoint()`，由策略控制器驱动实际触发与机制选择。【F:train_main.py†L297-L314】  
+- 使用 `TrainConfig` 与可选的 JSON 配置文件集中管理参数，运行时初始化逻辑封装在 `init_runtime()` 中，避免与训练循环耦合。【F:train.py†L26-L241】  
+- 训练步结束后发送 `ObservationEvent`（非阻塞）并写入 `obs_metrics.csv`，观测数据来自异步窗口统计与最新快照。【F:train.py†L225-L341】  
+- 观测快照喂给 `PhaseInference.update()` 产生适用性状态，并将 `phase_state`/`observation_stats` 传入 `maybe_checkpoint()`。【F:train.py†L278-L341】  
 
 ### 6) 旧版 checkpoint 管理器：`checkpointing.py`
 **职能**  
