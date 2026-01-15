@@ -178,6 +178,7 @@ class ProfilerObservationConfig:
     """Profiler 观测配置，控制采样频率与窗口统计。"""
 
     enabled: bool = True
+    aggregate_stats: bool = False
     window_size: int = 50
     schedule_wait: int = 1
     schedule_warmup: int = 1
@@ -248,7 +249,8 @@ class ObservationWorker:
                 snapshot = item["payload"]
                 with self._lock:
                     self._latest_trace = snapshot
-                    self._records.append(snapshot)
+                    if self.cfg.aggregate_stats:
+                        self._records.append(snapshot)
             self._queue.task_done()
 
     def _percentile(self, values: List[float], pct: float) -> Optional[float]:
@@ -325,6 +327,8 @@ class ObservationWorker:
 
     def get_window_stats(self) -> Dict[str, Optional[float]]:
         """返回窗口统计（可能滞后）。"""
+        if not self.cfg.aggregate_stats:
+            return {}
         with self._lock:
             if not self._records:
                 return {}

@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--async-timeout-s", type=float, default=1.0)
     parser.add_argument("--obs-window", type=int, default=50)
     parser.add_argument("--obs-report-every", type=int, default=10)
+    parser.add_argument("--obs-aggregate-stats", action="store_true", default=False)
     parser.add_argument("--profiler-enabled", action="store_true", default=False)
     parser.add_argument("--profiler-wait", type=int, default=1)
     parser.add_argument("--profiler-warmup", type=int, default=1)
@@ -147,6 +148,7 @@ def main() -> None:
     phase_inference = PhaseInference(phase_cfg)
     profiler_cfg = ProfilerObservationConfig(
         enabled=args.profiler_enabled,
+        aggregate_stats=args.obs_aggregate_stats,
         window_size=args.obs_window,
         schedule_wait=args.profiler_wait,
         schedule_warmup=args.profiler_warmup,
