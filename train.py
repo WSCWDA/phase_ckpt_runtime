@@ -47,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs-window", type=int, default=50)
     parser.add_argument("--obs-report-every", type=int, default=10)
     parser.add_argument("--obs-aggregate-stats", action="store_true", default=False)
+    parser.add_argument("--dcgm-enabled", action="store_true", default=False)
+    parser.add_argument("--dcgm-poll-interval-s", type=float, default=2.0)
+    parser.add_argument("--dcgm-window-size", type=int, default=60)
     parser.add_argument("--profiler-enabled", action="store_true", default=False)
     parser.add_argument("--profiler-wait", type=int, default=1)
     parser.add_argument("--profiler-warmup", type=int, default=1)
@@ -150,6 +153,9 @@ def main() -> None:
         enabled=args.profiler_enabled,
         aggregate_stats=args.obs_aggregate_stats,
         window_size=args.obs_window,
+        dcgm_enabled=args.dcgm_enabled,
+        dcgm_poll_interval_s=args.dcgm_poll_interval_s,
+        dcgm_window_size=args.dcgm_window_size,
         schedule_wait=args.profiler_wait,
         schedule_warmup=args.profiler_warmup,
         schedule_active=args.profiler_active,
@@ -222,11 +228,7 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            with torch.profiler.record_function("optimizer_step"):
-                optimizer.step()
-            observation.emit(ObservationEvent(step_id=step, step_time_s=time.perf_counter() - step_start))
-            observation.step_end()
-
+            optimizer.step()
             step_time = time.perf_counter() - step_start
             queue_depth = runtime.get_queue_depth()
             last_persisted = runtime.get_last_persisted_step()
@@ -236,6 +238,18 @@ def main() -> None:
             if runtime.num_completed > prev_completed:
                 ckpt_latency = runtime.get_last_completed_latency()
                 prev_completed = runtime.num_completed
+            observation.emit(
+                ObservationEvent(
+                    step_id=step,
+                    event_time_s=time.perf_counter(),
+                    step_time_s=step_time,
+                    ckpt_write_time_s=ckpt_latency,
+                    queue_depth=queue_depth,
+                    last_persisted_step=last_persisted,
+                    staleness_steps=staleness,
+                )
+            )
+            observation.step_end()
             loss_value = float(loss.detach().cpu().item())
             if full_ckpt_size is None:
                 full_ckpt_size = estimate_state_bytes(model.state_dict())
