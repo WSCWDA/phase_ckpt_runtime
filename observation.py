@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+"""Observation subsystem.
+
+This module is asynchronous by design: training emits lightweight events into a
+bounded queue, while profiling and aggregation happen in a background worker.
+The observation view is intentionally stale; decisions rely on windowed history
+instead of per-step precision to avoid blocking the training critical path.
+"""
+
+import math
 import queue
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Iterable, List, Optional
+
+import torch
+from torch import profiler
 
 
 @dataclass
@@ -149,3 +162,375 @@ class AsyncObservationWorker:
         self.queue.join()
         self.queue.put(None)
         self._thread.join()
+
+
+@dataclass
+class ObservationEvent:
+    """训练线程发出的轻量事件（可丢弃）。"""
+
+    step_id: int
+    step_time_s: float
+    ckpt_triggered: Optional[bool] = None
+
+
+@dataclass
+class ProfilerObservationConfig:
+    """Profiler 观测配置，控制采样频率与窗口统计。"""
+
+    enabled: bool = True
+    window_size: int = 50
+    schedule_wait: int = 1
+    schedule_warmup: int = 1
+    schedule_active: int = 2
+    schedule_repeat: int = 0
+
+
+class ObservationWorker:
+    """异步观测工作线程，负责 profiler 生命周期与统计聚合。"""
+
+    def __init__(self, cfg: ProfilerObservationConfig):
+        self.cfg = cfg
+        self._records: Deque[Dict[str, Optional[float]]] = deque(maxlen=cfg.window_size)
+        self._latest_trace: Dict[str, Optional[float]] = {}
+        self._queue: queue.Queue[Optional[ObservationEvent]] = queue.Queue(maxsize=cfg.window_size * 4)
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._profiler: Optional[profiler.profile] = None
+        self._thread.start()
+
+    def emit(self, event: ObservationEvent) -> None:
+        """训练路径的非阻塞事件投递，队列满时直接丢弃。"""
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            return
+
+    def step_begin(self) -> None:
+        """兼容接口：训练路径调用时不执行任何阻塞操作。"""
+        return
+
+    def step_end(self) -> None:
+        """兼容接口：训练路径调用时不执行任何阻塞操作。"""
+        return
+
+    def _init_profiler(self) -> None:
+        if not self.cfg.enabled:
+            return
+        activities = [profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(profiler.ProfilerActivity.CUDA)
+        schedule = profiler.schedule(
+            wait=self.cfg.schedule_wait,
+            warmup=self.cfg.schedule_warmup,
+            active=self.cfg.schedule_active,
+            repeat=self.cfg.schedule_repeat,
+        )
+        self._profiler = profiler.profile(
+            activities=activities,
+            schedule=schedule,
+            on_trace_ready=self._on_profiler_trace,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        self._profiler.__enter__()
+
+    def _worker(self) -> None:
+        """后台线程：消费事件、推进 profiler 并更新统计。"""
+        self._init_profiler()
+        while True:
+            event = self._queue.get()
+            if event is None:
+                self._queue.task_done()
+                break
+            if self._profiler is not None:
+                self._profiler.step()
+            with self._lock:
+                self._latest_trace["step_time"] = event.step_time_s
+            self._queue.task_done()
+        if self._profiler is not None:
+            self._profiler.__exit__(None, None, None)
+
+    def _percentile(self, values: List[float], pct: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+        return ordered[min(max(idx, 0), len(ordered) - 1)]
+
+    def _variance(self, values: List[float]) -> Optional[float]:
+        if len(values) < 2:
+            return None
+        mean = sum(values) / len(values)
+        return sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+
+    def _trend(self, values: Iterable[float], tolerance: float = 0.0) -> str:
+        values = list(values)
+        if len(values) < 2:
+            return "stable"
+        diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+        if all(diff >= -tolerance for diff in diffs) and any(diff > tolerance for diff in diffs):
+            return "increasing"
+        if all(diff <= tolerance for diff in diffs) and any(diff < -tolerance for diff in diffs):
+            return "decreasing"
+        return "stable"
+
+    def _extract(self, key: str) -> List[float]:
+        return [item[key] for item in self._records if item.get(key) is not None]
+
+    def _on_profiler_trace(self, prof: profiler.profile) -> None:
+        """处理 profiler trace，提取 coarse-grained 统计。"""
+        if not self.cfg.enabled:
+            return
+        events = {evt.key: evt for evt in prof.key_averages()}
+
+        def _cpu_us(key: str) -> Optional[float]:
+            evt = events.get(key)
+            return evt.cpu_time_total if evt is not None else None
+
+        def _cuda_us(key: str) -> Optional[float]:
+            evt = events.get(key)
+            if evt is None:
+                return None
+            cuda_total = getattr(evt, "cuda_time_total", None)
+            if cuda_total is None:
+                cuda_total = getattr(evt, "self_cuda_time_total", None)
+            return cuda_total
+
+        step_cpu = _cpu_us("train_step")
+        step_cuda = _cuda_us("train_step")
+        write_cpu = _cpu_us("checkpoint_write")
+
+        step_time = step_cpu / 1e6 if step_cpu is not None else None
+        compute_time = step_cuda / 1e6 if step_cuda is not None else None
+        checkpoint_write_time = write_cpu / 1e6 if write_cpu is not None else None
+
+        overlap_ratio = None
+        if step_time is not None and compute_time is not None and checkpoint_write_time is not None:
+            overlapped = max(compute_time + checkpoint_write_time - step_time, 0.0)
+            overlap_ratio = overlapped / checkpoint_write_time if checkpoint_write_time else 0.0
+
+        snapshot = {
+            "step_time": step_time or self._latest_trace.get("step_time"),
+            "compute_time": compute_time,
+            "checkpoint_write_time": checkpoint_write_time,
+            "checkpoint_overlap_ratio": overlap_ratio,
+        }
+        with self._lock:
+            self._latest_trace = snapshot
+            self._records.append(snapshot)
+
+    def get_window_stats(self) -> Dict[str, Optional[float]]:
+        """返回窗口统计（可能滞后）。"""
+        with self._lock:
+            if not self._records:
+                return {}
+            step_times = self._extract("step_time")
+            compute_times = self._extract("compute_time")
+            ckpt_write = self._extract("checkpoint_write_time")
+            ratios = []
+            for step_time, compute_time in zip(step_times, compute_times):
+                if step_time:
+                    ratios.append(compute_time / step_time if compute_time is not None else 0.0)
+            stats = {
+                "step_time_mean": sum(step_times) / len(step_times) if step_times else None,
+                "step_time_var": self._variance(step_times),
+                "step_time_p50": self._percentile(step_times, 50),
+                "step_time_p95": self._percentile(step_times, 95),
+                "step_time_p99": self._percentile(step_times, 99),
+                "compute_time_mean": sum(compute_times) / len(compute_times) if compute_times else None,
+                "compute_time_p95": self._percentile(compute_times, 95),
+                "checkpoint_write_p95": self._percentile(ckpt_write, 95),
+                "checkpoint_write_p99": self._percentile(ckpt_write, 99),
+                "compute_step_ratio_mean": sum(ratios) / len(ratios) if ratios else None,
+                "step_time_trend": self._trend(step_times),
+                "compute_ratio_trend": self._trend(ratios),
+            }
+            if stats["step_time_mean"]:
+                stats["progress_rate_steps_per_s"] = 1.0 / stats["step_time_mean"]
+            else:
+                stats["progress_rate_steps_per_s"] = None
+            return stats
+
+    def get_latest_trace(self) -> Dict[str, Optional[float]]:
+        with self._lock:
+            return dict(self._latest_trace)
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._thread.join()
+
+
+class ProfilerObservation:
+    """基于 PyTorch Profiler 的观测模块，用于采样运行时统计。"""
+
+    def __init__(self, cfg: ProfilerObservationConfig):
+        self.cfg = cfg
+        self._records: Deque[Dict[str, Optional[float]]] = deque(maxlen=cfg.window_size)
+        self._last_step_start: Optional[float] = None
+        self._latest_trace: Dict[str, Optional[float]] = {}
+        self._profiler: Optional[profiler.profile] = None
+        if cfg.enabled:
+            activities = [profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(profiler.ProfilerActivity.CUDA)
+            schedule = profiler.schedule(
+                wait=cfg.schedule_wait,
+                warmup=cfg.schedule_warmup,
+                active=cfg.schedule_active,
+                repeat=cfg.schedule_repeat,
+            )
+            self._profiler = profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                on_trace_ready=self.on_profiler_trace,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self._profiler.__enter__()
+
+    def _percentile(self, values: List[float], pct: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+        return ordered[min(max(idx, 0), len(ordered) - 1)]
+
+    def _variance(self, values: List[float]) -> Optional[float]:
+        if len(values) < 2:
+            return None
+        mean = sum(values) / len(values)
+        return sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+
+    def _trend(self, values: Iterable[float], tolerance: float = 0.0) -> str:
+        values = list(values)
+        if len(values) < 2:
+            return "stable"
+        diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+        if all(diff >= -tolerance for diff in diffs) and any(diff > tolerance for diff in diffs):
+            return "increasing"
+        if all(diff <= tolerance for diff in diffs) and any(diff < -tolerance for diff in diffs):
+            return "decreasing"
+        return "stable"
+
+    def _extract(self, key: str) -> List[float]:
+        return [item[key] for item in self._records if item.get(key) is not None]
+
+    def step_begin(self) -> None:
+        """记录训练步开始时间。"""
+        if not self.cfg.enabled:
+            return
+        self._last_step_start = time.perf_counter()
+
+    def step_end(self) -> None:
+        """结束训练步并推进 profiler 调度。"""
+        if not self.cfg.enabled:
+            return
+        if self._last_step_start is not None:
+            wall_time = time.perf_counter() - self._last_step_start
+            self._latest_trace["step_time"] = wall_time
+        if self._profiler is not None:
+            self._profiler.step()
+
+    def on_profiler_trace(self, prof: profiler.profile) -> None:
+        """处理 profiler trace，提取 checkpoint 与训练时间统计。"""
+        if not self.cfg.enabled:
+            return
+        events = {evt.key: evt for evt in prof.key_averages()}
+        def _cpu_us(key: str) -> Optional[float]:
+            evt = events.get(key)
+            return evt.cpu_time_total if evt is not None else None
+
+        def _cuda_us(key: str) -> Optional[float]:
+            evt = events.get(key)
+            if evt is None:
+                return None
+            cuda_total = getattr(evt, "cuda_time_total", None)
+            if cuda_total is None:
+                cuda_total = getattr(evt, "self_cuda_time_total", None)
+            return cuda_total
+
+        step_cpu = _cpu_us("train_step")
+        step_cuda = _cuda_us("train_step")
+        optimizer_cpu = _cpu_us("optimizer_step")
+        serialize_cpu = _cpu_us("checkpoint_serialize")
+        write_cpu = _cpu_us("checkpoint_write")
+
+        step_time = step_cpu / 1e6 if step_cpu is not None else None
+        compute_time = step_cuda / 1e6 if step_cuda is not None else None
+        optimizer_time = optimizer_cpu / 1e6 if optimizer_cpu is not None else None
+        checkpoint_serialize_time = serialize_cpu / 1e6 if serialize_cpu is not None else None
+        checkpoint_write_time = write_cpu / 1e6 if write_cpu is not None else None
+        checkpoint_total = None
+        if checkpoint_serialize_time is not None or checkpoint_write_time is not None:
+            checkpoint_total = (checkpoint_serialize_time or 0.0) + (checkpoint_write_time or 0.0)
+        cpu_overhead = None
+        if step_time is not None and compute_time is not None:
+            cpu_overhead = max(step_time - compute_time, 0.0)
+
+        overlap_ratio = None
+        if step_time is not None and compute_time is not None and checkpoint_write_time is not None:
+            overlapped = max(compute_time + checkpoint_write_time - step_time, 0.0)
+            overlap_ratio = overlapped / checkpoint_write_time if checkpoint_write_time else 0.0
+
+        snapshot = {
+            "step_time": step_time or self._latest_trace.get("step_time"),
+            "compute_time": compute_time,
+            "optimizer_time": optimizer_time,
+            "cpu_overhead_time": cpu_overhead,
+            "checkpoint_serialize_time": checkpoint_serialize_time,
+            "checkpoint_write_time": checkpoint_write_time,
+            "checkpoint_total_time": checkpoint_total,
+            "checkpoint_overlap_ratio": overlap_ratio,
+        }
+        self._latest_trace = snapshot
+        self._records.append(snapshot)
+
+    def window_stats(self) -> Dict[str, Optional[float]]:
+        """返回窗口统计量，供决策层使用。"""
+        if not self._records:
+            return {}
+        step_times = self._extract("step_time")
+        compute_times = self._extract("compute_time")
+        ckpt_write = self._extract("checkpoint_write_time")
+        ckpt_total = self._extract("checkpoint_total_time")
+        ratios = []
+        for step_time, compute_time in zip(step_times, compute_times):
+            if step_time:
+                ratios.append(compute_time / step_time if compute_time is not None else 0.0)
+        stats = {
+            "step_time_mean": sum(step_times) / len(step_times) if step_times else None,
+            "step_time_var": self._variance(step_times),
+            "step_time_p50": self._percentile(step_times, 50),
+            "step_time_p95": self._percentile(step_times, 95),
+            "step_time_p99": self._percentile(step_times, 99),
+            "compute_time_mean": sum(compute_times) / len(compute_times) if compute_times else None,
+            "compute_time_p95": self._percentile(compute_times, 95),
+            "compute_time_p99": self._percentile(compute_times, 99),
+            "checkpoint_write_p95": self._percentile(ckpt_write, 95),
+            "checkpoint_write_p99": self._percentile(ckpt_write, 99),
+            "checkpoint_total_mean": sum(ckpt_total) / len(ckpt_total) if ckpt_total else None,
+            "compute_step_ratio_mean": sum(ratios) / len(ratios) if ratios else None,
+            "step_time_trend": self._trend(step_times),
+            "compute_ratio_trend": self._trend(ratios),
+        }
+        if stats["step_time_mean"]:
+            stats["progress_rate_steps_per_s"] = 1.0 / stats["step_time_mean"]
+        else:
+            stats["progress_rate_steps_per_s"] = None
+        return stats
+
+    def snapshot(self) -> Dict[str, Optional[float]]:
+        """返回最新一批 trace 的快照与窗口统计。"""
+        snapshot = dict(self._latest_trace)
+        snapshot.update(self.window_stats())
+        return snapshot
+
+    def close(self) -> None:
+        if self._profiler is not None:
+            self._profiler.__exit__(None, None, None)
