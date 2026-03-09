@@ -75,7 +75,7 @@ class TrainConfig:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase-aware checkpoint runtime prototype")
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config override")
-    parser.add_argument("--model", choices=["dlrm", "resnet50", "gpt2", "llama3", "deepseek_moe"])
+    parser.add_argument("--model", choices=["dlrm", "resnet50", "gpt2", "llama3", "deepseek_moe", "pythia-410m"])
     parser.add_argument("--strategy", choices=["sync", "async", "phase"])
     parser.add_argument("--steps", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -138,6 +138,22 @@ def load_config(args: argparse.Namespace) -> TrainConfig:
     return cfg
 
 
+def load_config(args: argparse.Namespace) -> TrainConfig:
+    cfg = TrainConfig()
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as handle:
+            overrides = json.load(handle)
+        for key, value in overrides.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+    for key, value in vars(args).items():
+        if key == "config":
+            continue
+        if value is not None and hasattr(cfg, key.replace("-", "_")):
+            setattr(cfg, key.replace("-", "_"), value)
+    return cfg
+
+
 def build_model(cfg: TrainConfig, device: torch.device):
     if cfg.model == "dlrm":
         config = DLRMConfig(
@@ -163,22 +179,35 @@ def build_model(cfg: TrainConfig, device: torch.device):
         batcher = lambda: generate_cv_batch(cfg.batch_size, cfg.num_classes, cfg.image_size, device)
         return model, loss_fn, batcher
 
-    config = TransformerConfig(
-        vocab_size=cfg.vocab_size,
-        max_seq_len=cfg.seq_len,
-        d_model=cfg.d_model,
-        n_heads=cfg.n_heads,
-        n_layers=cfg.n_layers,
-        dropout=cfg.dropout,
-    )
-    if cfg.model == "gpt2":
+    if cfg.model == "pythia-410m":
+        # Pythia-410M-like preset: larger width/depth than default toy GPT config.
+        # Keep CLI compatibility by preserving seq_len/vocab_size/dropout overrides.
+        config = TransformerConfig(
+            vocab_size=cfg.vocab_size,
+            max_seq_len=cfg.seq_len,
+            d_model=1024,
+            n_heads=16,
+            n_layers=24,
+            dropout=cfg.dropout,
+        )
         model = TransformerLM(config, use_rmsnorm=False, llama_style=False).to(device)
-    elif cfg.model == "llama3":
-        model = TransformerLM(config, use_rmsnorm=True, llama_style=True).to(device)
-    elif cfg.model == "deepseek_moe":
-        model = MoETransformerLM(config, num_experts=cfg.moe_experts, top_k=cfg.moe_top_k).to(device)
     else:
-        raise ValueError(f"Unsupported model: {cfg.model}")
+        config = TransformerConfig(
+            vocab_size=cfg.vocab_size,
+            max_seq_len=cfg.seq_len,
+            d_model=cfg.d_model,
+            n_heads=cfg.n_heads,
+            n_layers=cfg.n_layers,
+            dropout=cfg.dropout,
+        )
+        if cfg.model == "gpt2":
+            model = TransformerLM(config, use_rmsnorm=False, llama_style=False).to(device)
+        elif cfg.model == "llama3":
+            model = TransformerLM(config, use_rmsnorm=True, llama_style=True).to(device)
+        elif cfg.model == "deepseek_moe":
+            model = MoETransformerLM(config, num_experts=cfg.moe_experts, top_k=cfg.moe_top_k).to(device)
+        else:
+            raise ValueError(f"Unsupported model: {cfg.model}")
 
     loss_fn = nn.CrossEntropyLoss()
     batcher = lambda: generate_lm_batch(cfg.batch_size, cfg.seq_len, cfg.vocab_size, device)
