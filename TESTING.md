@@ -49,6 +49,8 @@ python train.py --steps 50 --obs-report-every 10 --obs-aggregate-stats
 python evaluation/run_observation_overhead.py --steps 200 --obs-report-every 10
 ```
 
+脚本会先对 `train.py` 做语法预检（`py_compile`），避免跑到中途才因脚本语法错误中断。
+
 脚本会按以下 case 依次运行并输出摘要：
 - `baseline`
 - `aggregate`

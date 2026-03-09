@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import py_compile
 import subprocess
 import sys
 import time
@@ -20,6 +21,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-script", type=str, default="train.py")
     return parser.parse_args()
 
+
+
+
+def preflight_train_script(train_script: str) -> None:
+    """Fail fast on syntax errors before running expensive benchmark cases."""
+
+    try:
+        py_compile.compile(train_script, doraise=True)
+    except py_compile.PyCompileError as exc:
+        raise RuntimeError(
+            f"Train script syntax check failed for {train_script}: {exc.msg}"
+        ) from exc
 
 def mean_step_time(csv_path: Path) -> Optional[float]:
     if not csv_path.exists():
@@ -45,6 +58,7 @@ def run_case(name: str, args: List[str]) -> Dict[str, Optional[float]]:
 
 def main() -> None:
     args = parse_args()
+    preflight_train_script(args.train_script)
     base_cmd = [
         sys.executable,
         args.train_script,
