@@ -122,6 +122,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--moe-aux-weight", type=float)
     return parser.parse_args()
 
+from __future__ import print_function
+
+def load_config(args: argparse.Namespace) -> TrainConfig:
+    cfg = TrainConfig()
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as handle:
+            overrides = json.load(handle)
+        for key, value in overrides.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+    for key, value in vars(args).items():
+        if key == "config":
+            continue
+        if value is not None and hasattr(cfg, key.replace("-", "_")):
+            setattr(cfg, key.replace("-", "_"), value)
+    return cfg
+
+
+def load_config(args: argparse.Namespace) -> TrainConfig:
+    cfg = TrainConfig()
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as handle:
+            overrides = json.load(handle)
+        for key, value in overrides.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+    for key, value in vars(args).items():
+        if key == "config":
+            continue
+        if value is not None and hasattr(cfg, key.replace("-", "_")):
+            setattr(cfg, key.replace("-", "_"), value)
+    return cfg
+
 
 def load_config(args: argparse.Namespace) -> TrainConfig:
     cfg = TrainConfig()
