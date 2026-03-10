@@ -2,7 +2,9 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from policy_controller import CheckpointPolicyController, PolicyDecision
 
 import torch
 import torch.distributed as dist
@@ -21,10 +23,19 @@ class PendingCheckpoint:
 
 class CheckpointManager:
     """旧版 checkpoint 管理器（保留备用）。"""
-    def __init__(self, base_dir: str, mode: str, io_delay: float = 0.0):
+    def __init__(
+        self,
+        base_dir: str,
+        mode: str,
+        io_delay: float = 0.0,
+        phase_inference: Optional[Any] = None,
+        policy_controller: Optional[CheckpointPolicyController] = None,
+    ):
         self.base_dir = base_dir
         self.mode = mode
         self.io_delay = io_delay
+        self.phase_inference = phase_inference
+        self.policy_controller = policy_controller
         self.pending: List[PendingCheckpoint] = []
         self._initialized_pg = False
         self.num_issued = 0
@@ -50,14 +61,33 @@ class CheckpointManager:
     def _checkpoint_path(self, step: int) -> str:
         return os.path.join(self.base_dir, f"step_{step:06d}")
 
-    def trigger(self, state: Dict[str, Any], step: int, bytes_estimate: int) -> Dict[str, Any]:
+    def trigger(
+        self,
+        state: Dict[str, Any],
+        step: int,
+        bytes_estimate: int,
+        phase_state: Optional[Any] = None,
+        observation_stats: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """触发一次 checkpoint 保存。"""
         path = self._checkpoint_path(step)
         metadata = {
             "ckpt_bytes": bytes_estimate,
             "ckpt_latency": 0.0,
         }
-        if self.mode == "sync":
+        mode = self.mode
+        observation_stats = observation_stats or {}
+        policy_decision: Optional[PolicyDecision] = None
+        if self.policy_controller:
+            policy_decision = self.policy_controller.decide(step, phase_state, observation_stats)
+            if not policy_decision.do_checkpoint:
+                metadata["policy_reason"] = policy_decision.reason
+                return metadata
+            mode = "async" if policy_decision.use_async else "sync"
+        if self.mode == "phase" and self.phase_inference is not None:
+            mode = "async" if self.phase_inference.should_enable_async_ckpt() else "sync"
+
+        if mode == "sync":
             start = time.time()
             writer = FileSystemWriter(path)
             save(state, storage_writer=writer)
@@ -71,8 +101,8 @@ class CheckpointManager:
             self.max_ckpt_latency_s = max(self.max_ckpt_latency_s, metadata["ckpt_latency"])
             return metadata
 
-        if self.mode != "async":
-            raise ValueError(f"Unsupported checkpoint mode: {self.mode}")
+        if mode != "async":
+            raise ValueError(f"Unsupported checkpoint mode: {mode}")
 
         self._ensure_distributed()
         start = time.time()
